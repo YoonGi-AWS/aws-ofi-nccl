@@ -5,7 +5,7 @@
 #
 
 AC_PREREQ([2.69])
-AC_INIT([aws-ofi-nccl], [1.1.5], [rashika@amazon.com], , [http://github.com/aws/aws-ofi-nccl])
+AC_INIT([aws-ofi-nccl], [1.3.0], [rashika@amazon.com], , [http://github.com/aws/aws-ofi-nccl])
 AC_CONFIG_SRCDIR([src/nccl_ofi_net.c])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_HEADERS([config.h])
@@ -14,6 +14,7 @@ AM_SILENT_RULES([yes])
 
 # Checks for programs.
 AC_PROG_CC
+AC_PROG_CC_STDC
 AC_PROG_MAKE_SET
 AM_PROG_AR
 

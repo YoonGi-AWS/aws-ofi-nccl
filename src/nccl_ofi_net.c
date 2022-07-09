@@ -99,6 +99,50 @@ void free_ofi_fl(free_list_t *nccl_ofi_req_fl)
 	free(nccl_ofi_req_fl);
 }
 
+static const char *nccl_ofi_req_state_str(nccl_ofi_req_state_t state)
+{
+	switch(state) {
+	case NCCL_OFI_REQ_CREATED:
+		return "CREATED";
+	case NCCL_OFI_REQ_PENDING:
+		return "PENDING";
+	case NCCL_OFI_REQ_COMPLETED:
+		return "COMPLETED";
+	case NCCL_OFI_REQ_ERROR:
+		return "ERROR";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *nccl_ofi_req_direction_str(nccl_ofi_req_state_t state)
+{
+	switch(state) {
+	case NCCL_OFI_SEND:
+		return "SEND";
+	case NCCL_OFI_RECV:
+		return "RECV";
+	default:
+		return "unknown";
+	}
+}
+
+/*
+ * @brief	Print NCCL OFI request information
+ */
+static const char *nccl_ofi_request_str(nccl_ofi_req_t *req)
+{
+	static char buf[256];
+	snprintf(buf, sizeof(buf), "{ buffer_index: %lu, dev: %d, size: %zu, state: %s, direction: %s }",
+		req->buffer_index,
+		req->dev,
+		req->size,
+		nccl_ofi_req_state_str(req->state),
+		nccl_ofi_req_direction_str(req->direction)
+	);
+	return buf;
+}
+
 /*
  * @brief	Assign an allocated NCCL OFI request buffer
  */
@@ -927,7 +971,7 @@ static ncclResult_t ofi_process_cq(nccl_ofi_t *nccl_ofi_comp)
 	struct fi_cq_tagged_entry cqe_tagged_buffers[cqe_burst];
 	nccl_ofi_req_t *req = NULL;
 	struct fid_cq *cq = nccl_ofi_comp->cq;
-	uint64_t control_bit_mask = ~(nccl_ofi_comp->max_tag);
+	uint64_t control_bit_mask = nccl_ofi_comp->max_tag + 1;
 
 	while (true) {
 
@@ -945,19 +989,30 @@ static ncclResult_t ofi_process_cq(nccl_ofi_t *nccl_ofi_comp)
 		}
 		else if (OFI_UNLIKELY(rc == -FI_EAVAIL)) {
 			rc = fi_cq_readerr(cq, &err_buffer, 0);
-			if (OFI_UNLIKELY(rc < 0)) {
+			if (OFI_UNLIKELY(rc == -FI_EAGAIN)) {
+				/*
+				 * Error not available yet.
+				 * fi_cq_read will keep returning -FI_EAVAIL so just bail out and try again later.
+				 */
+				break;
+			} else if (OFI_UNLIKELY(rc < 0)) {
 				NCCL_OFI_WARN("Unable to read from fi_cq_readerr. RC: %zd. Error: %s",
 					     rc,
-					     fi_cq_strerror(cq,
-						err_buffer.prov_errno,
-						err_buffer.err_data, NULL, 0));
+					     fi_strerror(-rc));
 				ret = ncclSystemError;
 				goto exit;
 			}
 
-			/* TODO: Add debug log to dump failed request details */
 			req = container_of(err_buffer.op_context,
 					   nccl_ofi_req_t, ctx);
+			NCCL_OFI_WARN("Request %p completed with error. RC: %d. Error: %s. Completed length: %ld, Request: %s",
+					req,
+					err_buffer.err,
+				    fi_cq_strerror(cq,
+						err_buffer.prov_errno,
+						err_buffer.err_data, NULL, 0),
+					(long)err_buffer.len,
+					nccl_ofi_request_str(req));
 			req->state = NCCL_OFI_REQ_ERROR;
 			req->size = err_buffer.len;
 		}
@@ -967,7 +1022,7 @@ static ncclResult_t ofi_process_cq(nccl_ofi_t *nccl_ofi_comp)
 		}
 		else {
 			NCCL_OFI_WARN("Unable to retrieve completion queue entries. RC: %zd, ERROR: %s",
-				     rc, fi_strerror(-ret));
+				     rc, fi_strerror(-rc));
 			ret = ncclSystemError;
 			goto exit;
 		}
@@ -1237,7 +1292,12 @@ static ncclResult_t ofi_getProperties(int dev, ncclNetProperties_t *props)
 		goto exit;
 	}
 
-	dev_props.name = strdup(nic_info->device_attr->name);
+	/* name is NULL if device is a part of multirail config */
+	/* overriding default name only if value is available from provider */
+	if (nic_info->device_attr->name) {
+		dev_props.name = strdup(nic_info->device_attr->name);
+	}
+
 	/* Speed reported in Mbps */
 	dev_props.speed = nic_info->link_attr->speed / (1e6);
 
@@ -1509,7 +1569,7 @@ static ssize_t send_connect_message(sendComm_t *sComm, nccl_ofi_req_t *req)
 	 */
 	rc = fi_tsend(sComm->local_ep, (void *)local_ep_addr,
 			MAX_EP_ADDR, NULL, sComm->remote_ep,
-			sComm->tag | ~max_tag, &req->ctx);
+			sComm->tag | (max_tag + 1), &req->ctx);
 	if (rc == -FI_EAGAIN) {
 		/*
 		 * Process completions so that you have enough
@@ -1812,7 +1872,7 @@ static ncclResult_t ofi_connect(int dev, void *handle, void **sendComm)
 		 */
 		rc = fi_tsend(sComm->local_ep, (void *)conn_info,
 			      sizeof(*conn_info), NULL, sComm->remote_ep,
-			      sComm->tag | ~max_tag, &req->ctx);
+			      sComm->tag | (max_tag + 1), &req->ctx);
 		if (rc == 0)
 			break;
 		else if (rc == -FI_EAGAIN) {
@@ -1929,7 +1989,7 @@ static ssize_t post_recv_conn(listenComm_t *lComm, char **buffer,
 
 	/* Post a buffer for receiving connection requests */
 	rc = fi_trecv(lComm->local_ep, (void *)*buffer, size,
-		      NULL, FI_ADDR_UNSPEC, lComm->tag | ~max_tag,
+		      NULL, FI_ADDR_UNSPEC, lComm->tag | (max_tag + 1),
 		      0, &req->ctx);
 	if (rc == -FI_EAGAIN) {
 		/*
@@ -2190,6 +2250,7 @@ static ncclResult_t ofi_accept(void *listenComm, void **recvComm)
 	uint64_t max_tag;
 	size_t req_size = sizeof(nccl_ofi_req_t);
 	struct fid_mr *mr_handle = NULL;
+	const long page_size = sysconf(_SC_PAGESIZE);
 
 	pthread_mutex_lock(&nccl_ofi_lock);
 	if (nccl_ofi_comp == NULL) {
@@ -2227,7 +2288,7 @@ static ncclResult_t ofi_accept(void *listenComm, void **recvComm)
 	/* Post a buffer for receiving connection requests */
 	do {
 		rc = fi_trecv(lComm->local_ep, (void *)&conn_info, sizeof(conn_info),
-			      NULL, FI_ADDR_UNSPEC, lComm->tag | ~max_tag,
+			      NULL, FI_ADDR_UNSPEC, lComm->tag | (max_tag + 1),
 			      0, &req->ctx);
 		if (rc == 0)
 			break;
@@ -2290,8 +2351,6 @@ static ncclResult_t ofi_accept(void *listenComm, void **recvComm)
 	rComm->local_ep_addr = lComm->local_ep_addr;
 	rComm->remote_ep = remote_ep;
 	rComm->dev = dev;
-
-	const long page_size = sysconf(_SC_PAGESIZE);
 
 	if (!ofi_nccl_gdr_flush_disable() && support_gdr) {
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Registering buffer for flush operations");
@@ -2681,6 +2740,7 @@ static ncclResult_t ofi_iflush(void* recvComm, void* buffer, int size,
 	uint64_t cuda_key = 0ULL;
 	struct fid_mr *mr_handle = NULL;
 	void *data = NULL;
+	void *flush_mr_desc = NULL;
 
 	if (ofi_nccl_gdr_flush_disable() || !support_gdr)
 		goto exit;
@@ -2720,12 +2780,6 @@ static ncclResult_t ofi_iflush(void* recvComm, void* buffer, int size,
 	if (mhandles && mhandles[flush_n])
 		mr_handle = (struct fid_mr *)mhandles[flush_n];
 
-	if (OFI_UNLIKELY(mr_handle == NULL)) {
-		ret = ncclSystemError;
-		NCCL_OFI_WARN("Invalid memory registration handle provided");
-		goto exit;
-	}
-
 	data = buffers[flush_n];
 #else
 	if (size == 0) {
@@ -2738,11 +2792,6 @@ static ncclResult_t ofi_iflush(void* recvComm, void* buffer, int size,
 	}
 
 	mr_handle = (struct fid_mr *)mhandle;
-	if (OFI_UNLIKELY(mr_handle == NULL)) {
-		ret = ncclSystemError;
-		NCCL_OFI_WARN("Invalid memory registration handle provided");
-		goto exit;
-	}
 
 	data = buffer;
 #endif
@@ -2768,19 +2817,27 @@ static ncclResult_t ofi_iflush(void* recvComm, void* buffer, int size,
 	req->dev = rComm->dev;
 	req->direction = NCCL_OFI_RECV;
 
-	/* Extract remote key */
-	cuda_key = fi_mr_key(mr_handle);
-	if (OFI_UNLIKELY(cuda_key == FI_KEY_NOTAVAIL)) {
-		ret = ncclSystemError;
-		NCCL_OFI_WARN("Memory registration may not have completed.");
-		goto error;
+	if (rComm->flush_buff.mr_handle != NULL) {
+		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
+		 * returns valid descriptors by valid handles */
+		flush_mr_desc = fi_mr_desc(rComm->flush_buff.mr_handle);
+	}
+
+	if (mr_handle != NULL) {
+		/* Extract remote key */
+		cuda_key = fi_mr_key(mr_handle);
+		if (OFI_UNLIKELY(cuda_key == FI_KEY_NOTAVAIL)) {
+			ret = ncclSystemError;
+			NCCL_OFI_WARN("Memory registration may not have completed.");
+			goto error;
+		}
 	}
 
 	/* Issue RDMA read */
 	do {
 		rc = fi_read(rComm->local_ep, rComm->flush_buff.host_buffer,
 			     rComm->flush_buff.size,
-			     fi_mr_desc(rComm->flush_buff.mr_handle),
+			     flush_mr_desc,
 			     rComm->local_ep_addr, (uint64_t)data,
 			     cuda_key, &req->ctx);
 		if (rc == 0) {
